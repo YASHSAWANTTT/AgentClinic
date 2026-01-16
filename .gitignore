@@ -4,3 +4,5 @@ results/*
 *.out
 agentClinic/
 .cursor/
+.env.local
+venv/
