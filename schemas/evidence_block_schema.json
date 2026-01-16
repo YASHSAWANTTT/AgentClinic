@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "required": ["task_type","discriminators","key_evidence","guideline","final_dx","confidence"],
+  "properties": {
+    "task_type": { "enum": ["Diagnosis", "Exposure"] },
+    "discriminators": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 3,
+      "items": { "type": "string", "minLength": 5, "maxLength": 120 }
+    },
+    "key_evidence": { "type": "string", "minLength": 10, "maxLength": 240 },
+    "guideline": {
+      "type": "object",
+      "required": ["source_id", "quote"],
+      "properties": {
+        "source_id": { "type": "string", "maxLength": 64 },
+        "quote": { "type": "string", "minLength": 20, "maxLength": 280 }
+      }
+    },
+    "final_dx": { "type": "string", "minLength": 3, "maxLength": 120 },
+    "confidence": { "enum": ["very certain","somewhat certain","uncertain"] }
+  }
+}
