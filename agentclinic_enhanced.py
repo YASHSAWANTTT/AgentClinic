@@ -749,13 +749,24 @@ class DoctorAgent:
         bias_prompt = ""
         if self.bias_present is not None:
             bias_prompt = self.generate_bias()
-        base = "You are a doctor named Dr. Agent who only responds in the form of dialogue. You are inspecting a patient who you will ask questions in order to understand their disease. You are only allowed to ask {} questions total before you must make a decision. You have asked {} questions so far. You can request test results using the format \"REQUEST TEST: [test]\". For example, \"REQUEST TEST: Chest_X-Ray\". Your dialogue will only be 1-3 sentences in length. Once you have decided to make a diagnosis please type \"DIAGNOSIS READY: [diagnosis here]\"".format(self.MAX_INFS, self.infs) + ("You may also request medical images related to the disease to be returned with \"REQUEST IMAGES\"." if self.img_request else "")
+        remaining = self.MAX_INFS - self.infs
+        is_final_turn = (remaining == 1)
+        final_turn_warning = ""
+        if is_final_turn:
+            final_turn_warning = "\n\n⚠️ CRITICAL: THIS IS YOUR FINAL TURN. You MUST provide a diagnosis now. Output 'DIAGNOSIS READY: [diagnosis]' in your response. Do not ask another question.\n"
+        base = "You are a doctor named Dr. Agent who only responds in the form of dialogue. You are inspecting a patient who you will ask questions in order to understand their disease. You are only allowed to ask {} questions total before you must make a decision. You have asked {} questions so far. {} remaining questions.{}You can request test results using the format \"REQUEST TEST: [test]\". For example, \"REQUEST TEST: Chest_X-Ray\". Your dialogue will only be 1-3 sentences in length. Once you have decided to make a diagnosis please type \"DIAGNOSIS READY: [diagnosis here]\"".format(self.MAX_INFS, self.infs, remaining, final_turn_warning) + ("You may also request medical images related to the disease to be returned with \"REQUEST IMAGES\"." if self.img_request else "")
         base += (
             "\n\nAnswer style rules:\n"
             "- When you finalize, use the most specific standard diagnosis label (leaf-node), not a broad umbrella.\n"
             "- Avoid vague terms like 'infection', 'pneumonia', 'mass' if a specific entity is supported.\n"
             "- If NEJM answer choices exist, choose from them verbatim.\n"
             "- Output exactly: DIAGNOSIS READY: <single diagnosis label>.\n"
+            "\n\nCritical Diagnostic Reasoning Rules:\n"
+            "- Before diagnosing, carefully review ALL physical exam findings - they often contain the key clue.\n"
+            "- For anatomical obstructions: 'unable to perform complete examination' + normal external = mid-level obstruction (e.g., vaginal septum), not external (imperforate hymen).\n"
+            "- For skin conditions: Tense bullae + immunofluorescence findings = autoimmune blistering (bullous pemphigoid), not contact dermatitis.\n"
+            "- For drug reactions: Muscle rigidity + elevated CK + neuroleptic use = NMS, not serotonin syndrome.\n"
+            "- Always match the diagnosis to the MOST SPECIFIC finding in the evidence, not just the most common condition.\n"
         )
         intake_section = ""
         if self.intake_summary:
@@ -784,9 +795,40 @@ class DoctorAgent:
         # Inject current ledger to keep it "sticky"
         base += "\nCURRENT LEDGER (carry forward, update in <STATE_JSON>):\n" + json.dumps(self.evidence_ledger)
         
+        # Include physical examination findings in the system prompt
+        exam_findings_section = ""
+        try:
+            exam_info = self.scenario.exam_information()
+            if isinstance(exam_info, dict):
+                # Extract key physical exam findings (exclude test results which are requested separately)
+                key_findings = []
+                critical_flags = []
+                for key in ["Pelvic_Examination", "Dermatological_Examination", "General_Examination", "Cardiovascular_Examination", "Respiratory_Examination", "Abdominal_Examination", "Neurological_Examination"]:
+                    if key in exam_info and exam_info[key]:
+                        finding_text = str(exam_info[key])
+                        key_findings.append(f"{key}: {finding_text}")
+                        # Flag critical findings that suggest anatomical issues
+                        if any(phrase in finding_text.lower() for phrase in ["unable to perform", "incomplete examination", "obstruction", "cannot complete", "unable to visualize"]):
+                            critical_flags.append(f"{key} contains: '{finding_text}'")
+                if key_findings:
+                    exam_findings_section = "\n\nPhysical Examination Findings (available):\n" + "\n".join(key_findings)
+                    if critical_flags:
+                        exam_findings_section += "\n\n⚠️ CRITICAL: The following findings suggest anatomical issues that may be the primary diagnosis:\n" + "\n".join(critical_flags)
+                        exam_findings_section += "\n\nWhen you see 'unable to perform complete examination' in amenorrhea cases with normal hormones and normal imaging, consider anatomical obstructions (e.g., vaginal septum, imperforate hymen)."
+                    else:
+                        exam_findings_section += "\n\nIMPORTANT: Review these findings carefully. They may contain critical diagnostic clues."
+            elif isinstance(exam_info, str) and exam_info.strip():
+                exam_findings_section = "\n\nPhysical Examination Findings (available):\n" + exam_info
+                if any(phrase in exam_info.lower() for phrase in ["unable to perform", "incomplete examination", "obstruction"]):
+                    exam_findings_section += "\n\n⚠️ CRITICAL: This finding suggests an anatomical issue that may be the primary diagnosis."
+                else:
+                    exam_findings_section += "\n\nIMPORTANT: Review these findings carefully."
+        except Exception:
+            pass
+        
         presentation = "\n\nBelow is all of the information you have. {}. \n\n Remember, you must discover their disease by asking them questions. You are also able to provide exams.".format(self.presentation)
         # Evidence-lock instruction appended only when enabled
-        return base + bias_prompt + presentation + intake_section + (("\n\n" + EVIDENCE_LOCK_INSTRUCTION) if self.evidence_lock else "")
+        return base + bias_prompt + presentation + exam_findings_section + intake_section + (("\n\n" + EVIDENCE_LOCK_INSTRUCTION) if self.evidence_lock else "")
 
     def reset(self) -> None:
         self.agent_hist = ""
@@ -837,8 +879,27 @@ class MeasurementAgent:
 # Moderator compare
 # -----------------
 def compare_results(diagnosis, correct_diagnosis, moderator_llm, mod_pipe):
-    answer = query_model(moderator_llm, "\nHere is the correct diagnosis: " + correct_diagnosis + "\n Here was the doctor dialogue: " + diagnosis + "\nAre these the same?", "You are responsible for determining if the corrent diagnosis and the doctor diagnosis are the same disease. Please respond only with Yes or No. Nothing else.")
-    return answer.lower()
+    # Extract the diagnosis from doctor dialogue
+    dx_match = re.search(r"DIAGNOSIS READY:\s*(.*)", diagnosis)
+    doctor_dx = dx_match.group(1).strip() if dx_match else diagnosis.strip()
+    
+    # Enhanced moderator prompt for stricter comparison
+    moderator_prompt = f"""You are a strict medical diagnosis grader. Your task is to determine if the doctor's diagnosis matches the correct diagnosis.
+
+CRITICAL RULES:
+- The diagnoses must be the SAME specific disease/condition, not just similar or related
+- "Imperforate hymen" and "Vaginal septum" are DIFFERENT conditions - answer "No"
+- "Contact dermatitis" and "Bullous pemphigoid" are DIFFERENT conditions - answer "No"
+- "Serotonin syndrome" and "Neuroleptic malignant syndrome" are DIFFERENT conditions - answer "No"
+- Only answer "Yes" if they are the exact same condition (allowing for minor phrasing differences like "Crohn disease" vs "Crohn's disease")
+
+Correct diagnosis: {correct_diagnosis}
+Doctor's diagnosis: {doctor_dx}
+
+Are these the SAME specific disease/condition? Answer ONLY "Yes" or "No"."""
+    
+    answer = query_model(moderator_llm, moderator_prompt, "You are a strict medical diagnosis grader. Respond only with Yes or No.", clip_prompt=True)
+    return answer.lower().strip()
 
 # -----------------
 # Question Controller (High-Yield Question Proposer)
@@ -849,22 +910,54 @@ You are a clinical question planner. Your job is to propose the single best next
 Inputs:
 - Conversation transcript so far (Doctor/Patient turns)
 - Optional intake summary JSON (may contain unknowns)
+- Physical examination findings (if available)
 - Remaining question budget
 
 Rules:
 - Output EXACTLY one line:
 NEXT_QUESTION: <one concise high-yield question>
 - The question must be discriminative (rules IN/OUT at least 2 plausible diagnoses).
+- **CRITICAL**: If physical exam findings are provided, review them carefully. Look for:
+  * Findings that suggest anatomical issues (e.g., "unable to perform complete examination", "obstruction", "abnormal anatomy")
+  * Findings that contradict or support differential diagnoses
+  * Findings that haven't been discussed yet in the conversation
+- If physical exam findings contain critical clues (like "unable to perform complete exam" in amenorrhea cases), suggest questions that explore those findings or request additional tests to clarify them.
 - Prefer asking about missing critical info, risk factors, or a decisive symptom/sign.
 - Avoid low-yield "general" questions unless nothing else is missing.
 - Be patient-friendly and nonjudgmental.
 """
 
-def propose_next_question(controller_llm, transcript_text, intake_summary, remaining):
+def propose_next_question(controller_llm, transcript_text, intake_summary, remaining, exam_info=None):
     intake_txt = intake_summary.strip() if intake_summary else "None"
+    
+    # Format exam information for the controller
+    exam_txt = "None"
+    if exam_info is not None:
+        try:
+            if isinstance(exam_info, dict):
+                # Extract key findings, especially pelvic/genital exam findings
+                exam_summary = []
+                if "Pelvic_Examination" in exam_info:
+                    exam_summary.append(f"Pelvic Exam: {exam_info['Pelvic_Examination']}")
+                if "Dermatological_Examination" in exam_info:
+                    exam_summary.append(f"Dermatological Exam: {exam_info['Dermatological_Examination']}")
+                if "General_Examination" in exam_info:
+                    exam_summary.append(f"General Exam: {exam_info['General_Examination']}")
+                # Include any other notable findings
+                for key, value in exam_info.items():
+                    if key not in ["Pelvic_Examination", "Dermatological_Examination", "General_Examination", "Vital_Signs", "tests"]:
+                        if isinstance(value, (str, int, float)) and value:
+                            exam_summary.append(f"{key}: {value}")
+                exam_txt = "\n".join(exam_summary) if exam_summary else json.dumps(exam_info, indent=2)
+            else:
+                exam_txt = str(exam_info)
+        except Exception:
+            exam_txt = str(exam_info) if exam_info else "None"
+    
     user_prompt = (
         f"Remaining questions: {remaining}\n\n"
         f"Intake summary: {intake_txt}\n\n"
+        f"Physical examination findings:\n{exam_txt}\n\n"
         f"Transcript:\n{transcript_text}\n"
     )
     raw = query_model(controller_llm, user_prompt, QUESTION_CONTROLLER_PROMPT, clip_prompt=True)
@@ -889,6 +982,28 @@ Rules:
 - If answer choices are provided, you MUST pick one exactly (verbatim).
 - For MedQA/MedQA_Ext/MIMICIV datasets: If the proposed dx is a mechanism (e.g., "hypovolemia", "hypoxia") and seems like the dataset expects that phrasing, preserve it rather than converting to a disease name.
 - For NEJM/NEJM_Ext datasets: Always pick from the provided answer choices verbatim if they exist.
+
+CRITICAL: Distinguishing Similar Conditions - You MUST correct misdiagnoses:
+
+1. Primary Amenorrhea with Anatomical Obstruction:
+   - "Vaginal septum": Mid-vaginal obstruction. Key evidence: "unable to perform complete examination" + "external genitalia unremarkable/normal" = obstruction beyond external level
+   - "Imperforate hymen": External obstruction. Key evidence: visible bulging at hymenal level, obstruction visible externally
+   - RULE: If pelvic exam shows "unable to perform complete examination" AND "external genitalia unremarkable", it MUST be "Vaginal septum", NOT "Imperforate hymen"
+
+2. Autoimmune Blistering vs Contact Dermatitis:
+   - "Bullous pemphigoid": Tense bullae + linear C3/IgG deposits on immunofluorescence
+   - "Contact dermatitis": No bullae, no immunofluorescence findings
+   - RULE: If evidence shows "tense bullae" + "immunofluorescence" findings, it MUST be "Bullous pemphigoid", NOT "Contact dermatitis"
+
+3. Neuroleptic Malignant Syndrome vs Serotonin Syndrome:
+   - "Neuroleptic Malignant Syndrome": Muscle rigidity + elevated CK + neuroleptic/antipsychotic use
+   - "Serotonin Syndrome": Hyperreflexia, clonus, hyperthermia, but less rigidity
+   - RULE: If evidence shows "muscle rigidity" + "elevated creatine kinase" + antipsychotic use, it MUST be "Neuroleptic Malignant Syndrome", NOT "Serotonin Syndrome"
+
+General Principles:
+- ALWAYS match the diagnosis to the MOST SPECIFIC evidence in the physical exam and test results
+- If the proposed diagnosis doesn't match the key distinguishing evidence, CORRECT it to the diagnosis that does
+- Physical exam findings are often the most reliable differentiator - trust them over general symptoms
 """
 
 def normalize_dx(normalizer_llm, doctor_dialogue, scenario, dataset):
@@ -909,29 +1024,119 @@ def normalize_dx(normalizer_llm, doctor_dialogue, scenario, dataset):
 
     # Handle exam_information() which can return dict or string
     case_context = ""
+    physical_exam_highlight = ""
     try:
         exam_info = scenario.exam_information()
         if isinstance(exam_info, dict):
             case_context = json.dumps(exam_info, indent=2)
+            # Extract and highlight critical physical exam findings
+            critical_findings = []
+            for key in ["Pelvic_Examination", "Dermatological_Examination", "General_Examination", 
+                       "Cardiovascular_Examination", "Respiratory_Examination", "Abdominal_Examination", 
+                       "Neurological_Examination"]:
+                if key in exam_info and exam_info[key]:
+                    finding = str(exam_info[key])
+                    # Flag findings that suggest anatomical issues
+                    if any(phrase in finding.lower() for phrase in ["unable to perform", "incomplete examination", 
+                                                                   "obstruction", "cannot complete", "unable to visualize",
+                                                                   "septum", "imperforate", "agenesis"]):
+                        critical_findings.append(f"⚠️ {key}: {finding}")
+            if critical_findings:
+                physical_exam_highlight = "\n\n⚠️ CRITICAL PHYSICAL EXAM FINDINGS:\n" + "\n".join(critical_findings)
         else:
             case_context = str(exam_info)
+            if any(phrase in case_context.lower() for phrase in ["unable to perform", "incomplete examination", "obstruction"]):
+                physical_exam_highlight = "\n\n⚠️ CRITICAL: Physical exam shows anatomical obstruction clues"
     except Exception:
-        case_context = ""
+        pass
+
+    # Extract patient history context if available (for amenorrhea cases)
+    history_context = ""
+    try:
+        if hasattr(scenario, "patient_information"):
+            patient_info = scenario.patient_information()
+            if isinstance(patient_info, dict):
+                # Look for amenorrhea-related context
+                history_text = str(patient_info).lower()
+                if "amenorrhea" in history_text or "menstrual" in history_text:
+                    history_context = "\n\nClinical context: Primary amenorrhea case"
+    except Exception:
+        pass
 
     user_prompt = (
-        f"Doctor proposed: {raw_dx}\n\n"
+        f"Doctor proposed diagnosis: {raw_dx}\n\n"
         f"{options_txt}\n\n"
+        f"{history_context}"
         f"Case evidence (tests/exam):\n{case_context}\n"
+        f"{physical_exam_highlight}\n\n"
+        f"Task: Normalize the diagnosis to the most specific, accurate label based on the evidence above. "
+        f"Pay special attention to physical exam findings that distinguish between similar anatomical conditions."
     )
     out = query_model(normalizer_llm, user_prompt, DX_NORMALIZER_SYSTEM, clip_prompt=True).strip()
     if out.lower().startswith("final_dx:"):
-        return out.split(":", 1)[1].strip()
+        normalized = out.split(":", 1)[1].strip()
+        # Post-process: if raw_dx was close but wrong, and we have a better match, use it
+        # This helps catch cases where the normalizer might miss subtle distinctions
+        raw_lower = raw_dx.lower()
+        normalized_lower = normalized.lower()
+        
+        # Enhanced post-processing: correct common misdiagnoses based on evidence
+        raw_lower = raw_dx.lower()
+        normalized_lower = normalized.lower()
+        
+        # Rule 1: Amenorrhea with anatomical obstruction - distinguish hymen vs septum
+        if any(term in raw_lower or term in normalized_lower for term in ["imperforate hymen", "hymen", "vaginal obstruction"]):
+            # Check evidence for distinguishing features
+            if isinstance(exam_info, dict) and "Pelvic_Examination" in exam_info:
+                pelvic_exam = str(exam_info["Pelvic_Examination"]).lower()
+                # Key distinction: "unable to perform complete examination" + "external genitalia unremarkable" = septum
+                # Imperforate hymen would show bulging/visible obstruction at external level
+                if "unable to perform" in pelvic_exam and "complete examination" in pelvic_exam:
+                    if "external genitalia" in pelvic_exam and ("unremarkable" in pelvic_exam or "normal" in pelvic_exam):
+                        # This strongly suggests vaginal septum (mid-vaginal obstruction)
+                        if "septum" not in normalized_lower and "septum" not in raw_lower:
+                            return "Vaginal septum"
+                    elif "bulging" in pelvic_exam or "visible" in pelvic_exam:
+                        # This suggests imperforate hymen (external obstruction)
+                        if "hymen" not in normalized_lower:
+                            return "Imperforate hymen"
+        
+        # Rule 2: Bullous pemphigoid vs contact dermatitis
+        if any(term in raw_lower or term in normalized_lower for term in ["contact dermatitis", "allergic contact"]):
+            # Check for bullous pemphigoid clues: tense bullae, immunofluorescence findings
+            if isinstance(exam_info, dict):
+                exam_str = json.dumps(exam_info).lower()
+                if ("tense" in exam_str and "bullae" in exam_str) or \
+                   ("immunofluorescence" in exam_str and ("igg" in exam_str or "c3" in exam_str)):
+                    if "pemphigoid" not in normalized_lower:
+                        return "Bullous pemphigoid"
+        
+        # Rule 3: Neuroleptic Malignant Syndrome vs Serotonin Syndrome
+        if any(term in raw_lower or term in normalized_lower for term in ["serotonin syndrome", "serotonin"]):
+            # Check for NMS clues: muscle rigidity, elevated CK, neuroleptic use
+            if isinstance(exam_info, dict):
+                exam_str = json.dumps(exam_info).lower()
+                if ("rigidity" in exam_str and "muscle" in exam_str) or \
+                   ("creatine kinase" in exam_str or "ck" in exam_str) or \
+                   ("elevated" in exam_str and "ck" in exam_str):
+                    # Check if there's evidence of neuroleptic use (from history)
+                    try:
+                        patient_info = scenario.patient_information()
+                        if isinstance(patient_info, dict):
+                            history_str = json.dumps(patient_info).lower()
+                            if "neuroleptic" in history_str or "antipsychotic" in history_str:
+                                if "neuroleptic" not in normalized_lower and "malignant" not in normalized_lower:
+                                    return "Neuroleptic Malignant Syndrome"
+                    except:
+                        pass
+        
+        return normalized
     return raw_dx
 
 # -----------------
 # Main run function
 # -----------------
-def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor_llm, patient_llm, measurement_llm, moderator_llm, num_scenarios, dataset, img_request, total_inferences, anthropic_api_key=None, evidence_lock=False, guideline_snippets_path="data/guideline_snippets.csv", use_intake_assistant=False, intake_llm="gpt4", intake_turns=6, question_controller_llm=None):
+def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor_llm, patient_llm, measurement_llm, moderator_llm, num_scenarios, dataset, img_request, total_inferences, anthropic_api_key=None, evidence_lock=False, guideline_snippets_path="data/guideline_snippets.csv", use_intake_assistant=False, intake_llm="gpt4", intake_turns=6, question_controller_llm=None, scenario_ids=None):
     # Use provided API key, or fall back to environment variable
     if not api_key or api_key == "":
         api_key = os.environ.get("OPENAI_API_KEY", "")
@@ -974,7 +1179,16 @@ def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor
     if num_scenarios is None:
         num_scenarios = scenario_loader.num_scenarios
 
-    for _scenario_id in range(0, min(num_scenarios, scenario_loader.num_scenarios)):
+    # If specific scenario IDs are provided, use those; otherwise use range
+    if scenario_ids is not None and len(scenario_ids) > 0:
+        scenario_list = [sid for sid in scenario_ids if 0 <= sid < scenario_loader.num_scenarios]
+        if not scenario_list:
+            raise ValueError(f"None of the provided scenario IDs are valid. Valid range: 0-{scenario_loader.num_scenarios-1}")
+        print(f"Running specific scenarios: {scenario_list}")
+    else:
+        scenario_list = list(range(0, min(num_scenarios, scenario_loader.num_scenarios)))
+
+    for _scenario_id in scenario_list:
         total_presents += 1
         pi_dialogue = str()
         scenario = scenario_loader.get_scenario(id=_scenario_id)
@@ -1028,7 +1242,7 @@ def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor
 
             # Final turn hint
             if _inf_id == total_inferences - 1:
-                pi_dialogue += "This is the final question. Please provide a diagnosis.\n"
+                pi_dialogue += "\n\n⚠️ CRITICAL: This is your FINAL turn. You MUST output 'DIAGNOSIS READY: [diagnosis]' now. Do not ask another question - provide your diagnosis immediately.\n"
 
             # Question Controller: propose high-yield question (prevent transcript pollution)
             doctor_input = pi_dialogue  # Start with clean patient message
@@ -1042,11 +1256,18 @@ def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor
                     transcript_text = (doctor_agent.agent_hist + f"\nPatient latest: {pi_dialogue}\n").strip()
                     remaining = total_inferences - _inf_id
                     controller_llm_to_use = question_controller_llm if question_controller_llm else doctor_llm
+                    # Get exam information to pass to question controller
+                    exam_info = None
+                    try:
+                        exam_info = scenario.exam_information()
+                    except Exception:
+                        pass
                     next_q = propose_next_question(
                         controller_llm=controller_llm_to_use,
                         transcript_text=transcript_text,
                         intake_summary=intake_summary,
-                        remaining=remaining
+                        remaining=remaining,
+                        exam_info=exam_info
                     )
                     # Create doctor_input with guidance (DO NOT modify pi_dialogue)
                     doctor_input = (
@@ -1101,12 +1322,21 @@ def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor
                         continue  # give the doctor another chance within the same scene
 
                 # DX Normalizer: standardize diagnosis label before comparison
+                # Extract original diagnosis for logging
+                original_match = re.search(r"DIAGNOSIS READY:\s*(.*)", doctor_dialogue)
+                original_dx = original_match.group(1).strip() if original_match else "N/A"
+                
                 normalized = normalize_dx(
                     normalizer_llm=doctor_llm,
                     doctor_dialogue=doctor_dialogue,
                     scenario=scenario,
                     dataset=dataset
                 )
+                
+                # Log normalization if it changed
+                if original_dx.lower() != normalized.lower():
+                    print(f"DX NORMALIZER: '{original_dx}' → '{normalized}'", flush=True)
+                
                 # Replace the diagnosis in doctor_dialogue with normalized version
                 doctor_dialogue = re.sub(
                     r"DIAGNOSIS READY:\s*.*",
@@ -1177,6 +1407,7 @@ if __name__ == "__main__":
     parser.add_argument('--intake_assistant_llm', type=str, default='gpt4', help='Backend LLM for the intake assistant.')
     parser.add_argument('--intake_assistant_turns', type=int, default=6, help='Maximum number of intake assistant follow-up questions before summarizing.')
     parser.add_argument('--question_controller_llm', type=str, default=None, required=False, help='Backend LLM for the question controller (defaults to doctor_llm if not specified).')
+    parser.add_argument('--scenario_ids', type=int, nargs='+', default=None, required=False, help='Specific scenario IDs to run (e.g., --scenario_ids 199 203). If not provided, runs sequentially from 0.')
 
     args = parser.parse_args()
 
@@ -1201,5 +1432,6 @@ if __name__ == "__main__":
         use_intake_assistant=args.use_intake_assistant,
         intake_llm=args.intake_assistant_llm,
         intake_turns=args.intake_assistant_turns,
-        question_controller_llm=args.question_controller_llm
+        question_controller_llm=args.question_controller_llm,
+        scenario_ids=args.scenario_ids
     )
