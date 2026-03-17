@@ -39,8 +39,11 @@ def inference_huggingface(prompt, pipe):
 # ------------------------------------------------
 def query_model(model_str, prompt, system_prompt, tries=30, timeout=60.0, image_requested=False, scene=None, max_prompt_len=2**14, clip_prompt=False):
     global _openai_client
-    if model_str not in ["gpt4", "gpt3.5", "gpt4o", 'llama-2-70b-chat', "mixtral-8x7b", "gpt-4o-mini", "llama-3-70b-instruct", "gpt4v", "claude3.5sonnet", "o1-preview", "gpt-5.2", "gpt-5.2-pro", "gpt-5-mini", "gpt-5-nano"] and "_HF" not in model_str:
+    if model_str not in ["gpt4", "gpt3.5", "gpt4o", 'llama-2-70b-chat', "mixtral-8x7b", "gpt-4o-mini", "gpt-4.1-mini", "llama-3-70b-instruct", "gpt4v", "claude3.5sonnet", "o1-preview", "gpt-5.2", "gpt-5.2-pro", "gpt-5-mini", "gpt-5-nano"] and "_HF" not in model_str:
         raise Exception("No model by the name {}".format(model_str))
+    # Alias: treat "gpt-4.1-mini" as "gpt-4o-mini" for backend calls
+    if model_str == "gpt-4.1-mini":
+        model_str = "gpt-4o-mini"
     for attempt in range(tries):
         if clip_prompt: prompt = prompt[:max_prompt_len]
         try:
@@ -380,6 +383,10 @@ class ScenarioNEJMExtended:
     def patient_information(self) -> str:
         return self.patient_info
     def examiner_information(self) -> str:
+        answers = self.scenario_dict.get("answers", [])
+        opts = [a["text"] for a in answers if isinstance(a, dict) and "text" in a]
+        if opts:
+            return "What is the most likely diagnosis? Answer choices (pick one verbatim):\n" + "\n".join([f"- {o}" for o in opts])
         return "What is the most likely diagnosis?"
     def exam_information(self) -> str:
         return self.physical_exams
@@ -409,6 +416,10 @@ class ScenarioNEJM:
     def patient_information(self) -> str:
         return self.patient_info
     def examiner_information(self) -> str:
+        answers = self.scenario_dict.get("answers", [])
+        opts = [a["text"] for a in answers if isinstance(a, dict) and "text" in a]
+        if opts:
+            return "What is the most likely diagnosis? Answer choices (pick one verbatim):\n" + "\n".join([f"- {o}" for o in opts])
         return "What is the most likely diagnosis?"
     def exam_information(self) -> str:
         return self.physical_exams
@@ -730,6 +741,26 @@ def split_dialogue_and_state(text: str):
         dialogue = text.split(":", 1)[1].strip()
     else:
         dialogue = text.strip()
+
+    # Strip leaked evidence-ledger JSON (model sometimes appends {"key_positives":...} without <STATE_JSON>)
+    for sentinel in ["key_positives", "key_negatives", "working_ddx", '"abnormal_results"']:
+        idx = dialogue.find(sentinel)
+        if idx != -1:
+            # Find start of this JSON object (go back to preceding "  {" or "\n{")
+            start = dialogue.rfind("  {", 0, idx)
+            if start == -1:
+                start = dialogue.rfind("\n{", 0, idx)
+            if start != -1:
+                brace_start = dialogue.find("{", start)
+                if brace_start != -1:
+                    try:
+                        json_str, _ = _extract_nested_json(dialogue, brace_start)
+                        if json_str and state is None:
+                            state = json.loads(json_str)
+                    except Exception:
+                        pass
+                dialogue = dialogue[:start].strip()
+            break
     return dialogue, state
 
 # ----------------
@@ -854,8 +885,9 @@ class DoctorAgent:
             print("BIAS TYPE {} NOT SUPPORTED, ignoring bias...".format(self.bias_present))
         return ""
 
-    def inference_doctor(self, question, image_requested=False) -> str:
-        if self.infs >= self.MAX_INFS: return "Maximum inferences reached"
+    def inference_doctor(self, question, image_requested=False, allow_extra_feedback_turn=False) -> str:
+        if not allow_extra_feedback_turn and self.infs >= self.MAX_INFS:
+            return "Maximum inferences reached"
         answer = query_model(
             self.backend,
             "\nHere is a history of your dialogue: " + self.agent_hist + "\n Here was the patient response: " + question + "Now please continue your dialogue\nDoctor: ",
@@ -907,6 +939,8 @@ class DoctorAgent:
             "- Avoid vague terms like 'infection', 'pneumonia', 'mass' if a specific entity is supported.\n"
             "- If NEJM answer choices exist, choose from them verbatim.\n"
             "- Output exactly: DIAGNOSIS READY: <single diagnosis label>.\n"
+            "- Before committing, your final diagnosis MUST be one of your top 3 in working_ddx. If you have not listed it in working_ddx, do not output DIAGNOSIS READY yet—ask one more question or update working_ddx first.\n"
+            "- Optionally append confidence: DIAGNOSIS READY: <label> [CONFIDENCE: high|medium|low]\n"
             "\n\nCRITICAL: Diagnose the DISEASE/CONDITION, NOT a lab finding or symptom:\n"
             "- WRONG: 'Hyponatremia' (this is a lab finding, not a diagnosis)\n"
             "- RIGHT: 'Syndrome of Inappropriate Antidiuretic Hormone Secretion' (the disease causing hyponatremia)\n"
@@ -915,17 +949,8 @@ class DoctorAgent:
             "- WRONG: 'Elevated CK' (this is a lab finding)\n"
             "- RIGHT: 'Rhabdomyolysis' (the disease causing elevated CK)\n"
             "- Always think: 'What disease/condition is causing this finding?' NOT 'What is the finding?'\n"
-            "\n\nCritical Diagnostic Reasoning Rules:\n"
-            "- Before diagnosing, carefully review ALL physical exam findings - they often contain the key clue.\n"
-            "- For anatomical obstructions: 'unable to perform complete examination' + normal external = mid-level obstruction (e.g., vaginal septum), not external (imperforate hymen).\n"
-            "- For skin conditions: Tense bullae + immunofluorescence findings = autoimmune blistering (bullous pemphigoid), not contact dermatitis.\n"
-            "- For drug reactions: Muscle rigidity + elevated CK + neuroleptic use = NMS, not serotonin syndrome.\n"
-            "- For rectal bleeding: Prolapsed mass that can be pushed back = Hemorrhoids, NOT rectal cancer.\n"
-            "- For seizures: Temporal lobe EEG spikes = Complex partial seizure, NOT psychogenic non-epileptic.\n"
-            "- For diarrhea after antibiotics: Positive C. difficile toxin = C. difficile colitis, NOT generic 'antibiotic-associated diarrhea'.\n"
-            "- For shoulder pain: Global restriction with normal X-rays = Adhesive capsulitis, NOT rotator cuff tendinopathy.\n"
-            "- For lung disease: Reversible obstruction or episodic pattern = Asthma, NOT COPD.\n"
-            "- Always match the diagnosis to the MOST SPECIFIC finding in the evidence, not just the most common condition.\n"
+            "- Before diagnosing, carefully review ALL physical exam findings and test results.\n"
+            "- Use your clinical reasoning to match the diagnosis to the most specific finding supported by the evidence.\n"
         )
         intake_section = ""
         if self.intake_summary:
@@ -1090,8 +1115,160 @@ Are these the SAME specific disease/condition? Answer ONLY "Yes" or "No"."""
     answer = query_model(moderator_llm, moderator_prompt, "You are a strict medical diagnosis grader. Respond only with Yes or No.", clip_prompt=True)
     return answer.lower().strip()
 
+
 # -----------------
-# Question Controller (High-Yield Question Proposer)
+# Reasoning Critic and Evidence Checker (helper agents for first DIAGNOSIS READY)
+# -----------------
+REASONING_CRITIC_SYSTEM = """You are a clinical reasoning critic. You do NOT know the correct diagnosis.
+
+Given a conversation transcript and the doctor's proposed diagnosis, output exactly two lines in this format:
+ALTERNATIVES: <2-3 plausible alternative diagnoses that fit the evidence, comma-separated>
+DISTINCTION: <one key distinguishing question or test between the proposed diagnosis and the most likely alternative>
+
+Do not reveal or hint at the correct diagnosis. Use your own clinical reasoning to suggest plausible alternatives and one discriminative question or test."""
+
+EVIDENCE_CHECKER_SYSTEM = """You are an evidence consistency checker. You do NOT know the correct diagnosis.
+
+Given the conversation transcript, available exam/test evidence, and the doctor's proposed diagnosis, output exactly three lines in this format:
+SUPPORT: <findings from the transcript or evidence that support the proposed diagnosis>
+CONTRADICT: <2-3 specific findings that argue AGAINST the proposed diagnosis or fit another diagnosis better>
+ABSENT: <2-3 hallmark findings typically expected for this diagnosis but not mentioned or absent in the case>
+
+Do not reveal or hint at the correct diagnosis. Be specific: name the actual findings from the transcript. CONTRADICT and ABSENT help the doctor reconsider before committing."""
+
+
+def run_reasoning_critic(controller_llm, transcript_text, proposed_dx):
+    """Run the reasoning critic: returns ALTERNATIVES and DISTINCTION (generic, no gold dx)."""
+    user_prompt = (
+        f"Transcript:\n{transcript_text[:12000]}\n\n"
+        f"Proposed diagnosis: {proposed_dx}\n\n"
+        "Output ALTERNATIVES: and DISTINCTION: as specified."
+    )
+    out = query_model(controller_llm, user_prompt, REASONING_CRITIC_SYSTEM, clip_prompt=True)
+    out = (out or "").strip()
+    if not out:
+        out = "ALTERNATIVES: (none suggested)\nDISTINCTION: Consider a key distinguishing test or question."
+    return out
+
+
+def run_evidence_checker(controller_llm, transcript_text, exam_and_tests_text, proposed_dx):
+    """Run the evidence checker: returns SUPPORT, CONTRADICT, and ABSENT (generic, no gold dx)."""
+    user_prompt = (
+        f"Transcript:\n{transcript_text[:12000]}\n\n"
+        f"Exam/test evidence:\n{exam_and_tests_text[:4000]}\n\n"
+        f"Proposed diagnosis: {proposed_dx}\n\n"
+        "Output SUPPORT:, CONTRADICT:, and ABSENT: as specified."
+    )
+    out = query_model(controller_llm, user_prompt, EVIDENCE_CHECKER_SYSTEM, clip_prompt=True)
+    out = (out or "").strip()
+    if not out:
+        out = (
+            "SUPPORT: (review transcript)\n"
+            "CONTRADICT: Recheck findings that argue against the diagnosis.\n"
+            "ABSENT: List hallmark findings expected for this diagnosis but not present."
+        )
+    return out
+
+
+DEVIL_ADVOCATE_SYSTEM = """You are a devil's advocate. You do NOT know the correct diagnosis.
+
+Given the conversation transcript and the doctor's proposed diagnosis, argue AGAINST it. Output exactly:
+COUNTERARGUMENT: <2-4 sentences: the strongest reason(s) this diagnosis could be wrong, or why an alternative might fit better. Use only evidence from the transcript. Do not reveal or hint at the correct answer.>"""
+
+
+def run_devils_advocate(controller_llm, transcript_text, proposed_dx):
+    """Run devil's advocate: returns COUNTERARGUMENT (generic, no gold dx)."""
+    user_prompt = (
+        f"Transcript:\n{transcript_text[:12000]}\n\n"
+        f"Proposed diagnosis: {proposed_dx}\n\n"
+        "Output COUNTERARGUMENT: as specified."
+    )
+    out = query_model(controller_llm, user_prompt, DEVIL_ADVOCATE_SYSTEM, clip_prompt=True)
+    out = (out or "").strip()
+    if not out or "COUNTERARGUMENT:" not in out:
+        out = "COUNTERARGUMENT: Reconsider whether the evidence fully supports this diagnosis versus alternatives."
+    return out
+
+
+QUESTION_QUALITY_SYSTEM = """You are a question quality scorer. You do NOT know the correct diagnosis.
+
+Given the conversation transcript and the last question the doctor asked the patient, score how discriminative that question was for narrowing the differential (1-5).
+- 1-2: Low yield (generic, already answered, or does not rule in/out specific diagnoses).
+- 3: Moderately discriminative.
+- 4-5: High yield (clearly rules in/out at least one plausible diagnosis).
+
+Output EXACTLY one line: SCORE: <integer 1-5>"""
+
+
+def run_question_quality_scorer(controller_llm, transcript_text, last_doctor_question):
+    """Returns integer 1-5. Low = not discriminative."""
+    user_prompt = (
+        f"Transcript:\n{transcript_text[:8000]}\n\n"
+        f"Last doctor question: {last_doctor_question}\n\n"
+        "Output SCORE: <1-5> as specified."
+    )
+    out = query_model(controller_llm, user_prompt, QUESTION_QUALITY_SYSTEM, clip_prompt=True)
+    out = (out or "").strip()
+    m = re.search(r"SCORE:\s*(\d)", out)
+    if m:
+        return max(1, min(5, int(m.group(1))))
+    return 3
+
+
+TEST_ORDERING_SYSTEM = """You are a test-ordering advisor. You do NOT know the correct diagnosis.
+
+Given the conversation transcript, the doctor's current differential (list of possible diagnoses), and available exam/test context, suggest the single best test or question that would best distinguish among the top differential diagnoses.
+
+Output EXACTLY one line: SUGGESTED_TEST: <one specific test name or one key question to ask>"""
+
+
+def propose_test_for_ddx(controller_llm, transcript_text, working_ddx_list, exam_and_tests_text):
+    """Suggest one test or question to distinguish the differential. working_ddx_list: list of diagnosis strings."""
+    ddx_str = ", ".join(working_ddx_list[:5]) if working_ddx_list else "none stated"
+    user_prompt = (
+        f"Transcript:\n{transcript_text[:8000]}\n\n"
+        f"Current differential: {ddx_str}\n\n"
+        f"Exam/tests so far:\n{exam_and_tests_text[:3000]}\n\n"
+        "Output SUGGESTED_TEST: as specified."
+    )
+    out = query_model(controller_llm, user_prompt, TEST_ORDERING_SYSTEM, clip_prompt=True)
+    out = (out or "").strip()
+    if "SUGGESTED_TEST:" in out:
+        return out.split("SUGGESTED_TEST:", 1)[1].strip()
+    return ""
+
+
+def _get_working_ddx_strings(evidence_ledger):
+    """Extract list of diagnosis strings from working_ddx (may be list of str or list of dict)."""
+    wddx = evidence_ledger.get("working_ddx") or []
+    out = []
+    for item in wddx[:10]:
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip())
+        elif isinstance(item, dict):
+            for key in ["diagnosis", "dx", "name"]:
+                if key in item and isinstance(item[key], str) and item[key].strip():
+                    out.append(item[key].strip())
+                    break
+    return out
+
+
+def _dx_in_working_ddx(proposed_dx, working_ddx_strings):
+    """True if proposed_dx is in or closely matches one of working_ddx_strings."""
+    if not working_ddx_strings:
+        return True  # No ddx listed: allow (don't block)
+    p = proposed_dx.strip().lower()
+    for d in working_ddx_strings:
+        d = d.strip().lower()
+        if p == d or p in d or d in p:
+            return True
+        if set(p.split()) & set(d.split()):
+            return True
+    return False
+
+
+# -----------------
+# Question Controller (Generic: no diagnostic-specific hints)
 # -----------------
 QUESTION_CONTROLLER_PROMPT = """
 You are a clinical question planner. Your job is to propose the single best next question to maximize diagnostic accuracy.
@@ -1105,28 +1282,11 @@ Inputs:
 Rules:
 - Output EXACTLY one line:
 NEXT_QUESTION: <one concise high-yield question>
-- The question must be discriminative (rules IN/OUT at least 2 plausible diagnoses).
-- **CRITICAL**: If physical exam findings are provided, review them carefully. Look for:
-  * Findings that suggest anatomical issues (e.g., "unable to perform complete examination", "obstruction", "abnormal anatomy")
-  * Findings that contradict or support differential diagnoses
-  * Findings that haven't been discussed yet in the conversation
-- If physical exam findings contain critical clues (like "unable to perform complete exam" in amenorrhea cases), suggest questions that explore those findings or request additional tests to clarify them.
-- Prefer asking about missing critical info, risk factors, or a decisive symptom/sign.
-- Avoid low-yield "general" questions unless nothing else is missing.
+- The question must be discriminative (rules IN or OUT at least 2 plausible diagnoses from the conversation).
+- If physical exam findings are provided, review them and suggest questions that explore unexplained or critical findings.
+- Prefer asking about missing critical info, risk factors, or a decisive symptom/sign. Avoid low-yield general questions.
 - Be patient-friendly and nonjudgmental.
-
-**CRITICAL: When similar conditions are possible, ask questions that specifically distinguish them:**
-
-- For rectal bleeding: Ask about mass characteristics (fixed vs movable, pain, can it be pushed back?)
-- For seizures: Ask about EEG findings, aura (muddy taste), post-ictal state, or request EEG
-- For diarrhea after antibiotics: Ask about C. difficile toxin testing or request stool test
-- For lung disease: Ask about reversibility (bronchodilator response), smoking history, episodic vs persistent
-- For shoulder pain: Ask about range of motion (especially external rotation), request X-rays
-- For cholangitis: Ask about IBD history (ulcerative colitis), anti-mitochondrial antibodies
-- For bone tumors: Ask about imaging findings (soap bubble appearance, location)
-- For eczematous conditions: Ask about atopy history, request skin biopsy
-- For gonococcal infection: Ask about skin lesions AND joint involvement (disseminated vs localized)
-- For insect bites: Ask about pattern (linear arrangement suggests bed bugs)
+- Use only general clinical reasoning; do not assume specific disease categories.
 """
 
 def propose_next_question(controller_llm, transcript_text, intake_summary, remaining, exam_info=None):
@@ -1170,108 +1330,26 @@ def propose_next_question(controller_llm, transcript_text, intake_summary, remai
     return "Can you tell me more about what brought you in today, and what symptoms are bothering you most?"
 
 # -----------------
-# DX Normalizer (Diagnosis Label Standardizer)
+# DX Normalizer (Conservative: rephrase only, never substitute)
 # -----------------
 DX_NORMALIZER_SYSTEM = """
 You are a diagnosis label normalizer for an exam grader.
-Goal: output the single best diagnosis label in the most specific standard medical term.
 
-Rules:
+STRICT RULES:
 - Output EXACTLY one line: FINAL_DX: <label>
-- No extra text.
-- Prefer the most specific diagnosis supported by evidence (leaf-node).
-- Avoid umbrella terms like "pneumonia", "infection", "mass" unless evidence cannot be more specific.
-- If answer choices are provided, you MUST pick one exactly (verbatim).
-- For MedQA/MedQA_Ext/MIMICIV datasets: If the proposed dx is a mechanism (e.g., "hypovolemia", "hypoxia") and seems like the dataset expects that phrasing, preserve it rather than converting to a disease name.
-- For NEJM/NEJM_Ext datasets: Always pick from the provided answer choices verbatim if they exist.
-- BE CONSERVATIVE: If the original diagnosis is already specific and reasonable, only change it if there's clear evidence it's wrong.
-
-CRITICAL: Distinguishing Similar Conditions - You MUST correct misdiagnoses:
-
-1. Primary Amenorrhea with Anatomical Obstruction:
-   - "Vaginal septum": Mid-vaginal obstruction. Key evidence: "unable to perform complete examination" + "external genitalia unremarkable/normal" = obstruction beyond external level
-   - "Imperforate hymen": External obstruction. Key evidence: visible bulging at hymenal level, obstruction visible externally
-   - RULE: If pelvic exam shows "unable to perform complete examination" AND "external genitalia unremarkable", it MUST be "Vaginal septum", NOT "Imperforate hymen"
-
-2. Autoimmune Blistering vs Contact Dermatitis:
-   - "Bullous pemphigoid": Tense bullae + linear C3/IgG deposits on immunofluorescence
-   - "Contact dermatitis": No bullae, no immunofluorescence findings
-   - RULE: If evidence shows "tense bullae" + "immunofluorescence" findings, it MUST be "Bullous pemphigoid", NOT "Contact dermatitis"
-
-3. Neuroleptic Malignant Syndrome vs Serotonin Syndrome:
-   - "Neuroleptic Malignant Syndrome": Muscle rigidity + elevated CK + neuroleptic/antipsychotic use
-   - "Serotonin Syndrome": Hyperreflexia, clonus, hyperthermia, but less rigidity
-   - RULE: If evidence shows "muscle rigidity" + "elevated creatine kinase" + antipsychotic use, it MUST be "Neuroleptic Malignant Syndrome", NOT "Serotonin Syndrome"
-
-4. Rectal Bleeding:
-   - "Hemorrhoids": Prolapsed mass that can be easily pushed back, anoscopy shows internal hemorrhoids
-   - "Rectal cancer": Fixed mass, not easily pushed back, biopsy shows malignancy
-   - "Rectal prolapse": Full-thickness prolapse, different from hemorrhoids
-   - RULE: If exam shows "prolapsed mass that can be easily pushed back", it MUST be "Hemorrhoids", NOT "Rectal cancer"
-
-5. Seizure Types:
-   - "Complex partial seizure": Temporal lobe EEG findings (spikes/sharp waves), muddy taste, staring episodes
-   - "Psychogenic non-epileptic seizures": No EEG abnormalities, psychological triggers
-   - RULE: If EEG shows "interictal spikes and sharp waves localized to temporal lobes", it MUST be "Complex partial seizure", NOT "Psychogenic non-epileptic seizures"
-
-6. Diarrhea After Antibiotics:
-   - "C. difficile colitis": Watery diarrhea, recent antibiotic use, positive C. difficile toxin test
-   - "Antibiotic-associated diarrhea": Generic term, less specific
-   - RULE: If evidence shows "C. difficile toxin" or "Clostridium difficile", it MUST be "C. difficile colitis", NOT "Antibiotic-associated diarrhea"
-
-7. Cholangitis Types:
-   - "Primary sclerosing cholangitis": Associated with IBD (ulcerative colitis), bile duct thickening on imaging
-   - "Primary biliary cholangitis": Anti-mitochondrial antibodies positive, different pattern
-   - RULE: If patient has "ulcerative colitis" or "IBD", it MUST be "Primary sclerosing cholangitis", NOT "Primary biliary cholangitis"
-
-8. Shoulder Conditions:
-   - "Adhesive capsulitis": Global restriction, especially external rotation <45°, normal radiographs
-   - "Rotator cuff tendinopathy": Pain with overhead activities, weakness, may have impingement signs
-   - "Shoulder impingement syndrome": Painful arc, positive impingement tests
-   - RULE: If exam shows "external rotation 45° with pain" AND "normal radiographs", it MUST be "Adhesive capsulitis", NOT "Rotator cuff tendinopathy" or "Shoulder impingement"
-
-9. Obstructive Lung Diseases:
-   - "Asthma": Reversible obstruction, episodic, can have normal spirometry between attacks, triggered by allergens/exercise
-   - "COPD": Irreversible obstruction, progressive, smoking history, persistent symptoms
-   - RULE: If spirometry shows "reversible" obstruction OR history shows "episodic" or "worse at night", it MUST be "Asthma", NOT "COPD"
-
-10. Bone Tumors:
-    - "Osteoclastoma" (Giant cell tumor): Lytic lesion with "soap bubble" appearance, epiphyseal location
-    - "Aneurysmal bone cyst": Different imaging characteristics
-    - RULE: If imaging shows "soap bubble appearance" or "lytic lesion" in epiphysis, it MUST be "Osteoclastoma", NOT "Aneurysmal bone cyst"
-
-11. Eczematous Conditions:
-    - "Eczematous dermatitis": Generic term, intraepidermal edema on biopsy
-    - "Atopic dermatitis": Specific type, usually with atopy history
-    - RULE: If biopsy shows "intraepidermal accumulation of edematous fluid" but NO atopy history, it MUST be "Eczematous dermatitis", NOT "Atopic dermatitis"
-
-12. Gonococcal Infection:
-    - "Disseminated Gonococcal Infection": Skin lesions + joint involvement + positive gonorrhea test
-    - "Gonococcal arthritis": Localized joint infection
-    - RULE: If evidence shows BOTH skin lesions AND joint involvement, it MUST be "Disseminated Gonococcal Infection", NOT just "Gonococcal arthritis"
-
-13. Over-Specificity Prevention:
-    - "Respiratory Distress Syndrome" is correct; don't add "Neonatal" unless evidence specifically mentions newborn/premature
-    - "Osteoarthritis" is correct; don't add "of the hip and knee" unless evidence specifically mentions both locations
-    - RULE: Only add location/modifier if evidence clearly supports it AND it's necessary for accuracy
-
-14. Insect Bites:
-    - "Bed bug bite": Linear arrangement of papules, characteristic pattern
-    - "Insect bite reaction": Generic term
-    - RULE: If exam shows "linear line with red papules", it MUST be "Bed bug bite", NOT generic "Insect bite reaction"
-
-General Principles:
-- ALWAYS match the diagnosis to the MOST SPECIFIC evidence in the physical exam and test results
-- If the proposed diagnosis doesn't match the key distinguishing evidence, CORRECT it to the diagnosis that does
-- Physical exam findings are often the most reliable differentiator - trust them over general symptoms
-- BE CONSERVATIVE: If the original diagnosis is already specific and matches the evidence category, only change it if there's clear evidence it's wrong
-- DON'T over-specify: If the original diagnosis is correct, don't add unnecessary location/modifier details
+- NO extra text.
+- ONLY rephrase for standard spelling/terminology (e.g. "Crohn's disease" -> "Crohn disease", fix typos).
+- DO NOT substitute a different condition. If the doctor said "Dumping syndrome", do NOT output "Hypoglycemia". If the doctor said "Renal calculi", do NOT output "Renal cysts". Only minor wording/formatting changes are allowed.
+- If answer choices are provided (NEJM/NEJM_Ext), you MUST pick the answer choice that matches the doctor's diagnosis verbatim, or the closest match from the list. Do not replace with a different answer choice.
+- If the proposed diagnosis is already clear and specific, output it unchanged.
+- When in doubt, preserve the doctor's exact diagnosis.
 """
 
 def normalize_dx(normalizer_llm, doctor_dialogue, scenario, dataset):
-    # Extract raw diagnosis
+    # Extract raw diagnosis (strip optional CONFIDENCE suffix)
     m = re.search(r"DIAGNOSIS READY:\s*(.*)", doctor_dialogue)
     raw_dx = m.group(1).strip() if m else doctor_dialogue.strip()
+    raw_dx = re.sub(r"\s*\[?\s*CONFIDENCE:\s*(?:high|medium|low)\s*\]?\s*$", "", raw_dx, flags=re.I).strip()
 
     # For NEJM / NEJM_Ext, extract answer choices
     options_txt = ""
@@ -1284,253 +1362,50 @@ def normalize_dx(normalizer_llm, doctor_dialogue, scenario, dataset):
     except Exception:
         pass
 
-    # Handle exam_information() which can return dict or string
-    case_context = ""
-    physical_exam_highlight = ""
     try:
         exam_info = scenario.exam_information()
-        if isinstance(exam_info, dict):
-            case_context = json.dumps(exam_info, indent=2)
-            # Extract and highlight critical physical exam findings
-            critical_findings = []
-            for key in ["Pelvic_Examination", "Dermatological_Examination", "General_Examination", 
-                       "Cardiovascular_Examination", "Respiratory_Examination", "Abdominal_Examination", 
-                       "Neurological_Examination"]:
-                if key in exam_info and exam_info[key]:
-                    finding = str(exam_info[key])
-                    # Flag findings that suggest anatomical issues
-                    if any(phrase in finding.lower() for phrase in ["unable to perform", "incomplete examination", 
-                                                                   "obstruction", "cannot complete", "unable to visualize",
-                                                                   "septum", "imperforate", "agenesis"]):
-                        critical_findings.append(f"⚠️ {key}: {finding}")
-            if critical_findings:
-                physical_exam_highlight = "\n\n⚠️ CRITICAL PHYSICAL EXAM FINDINGS:\n" + "\n".join(critical_findings)
-        else:
-            case_context = str(exam_info)
-            if any(phrase in case_context.lower() for phrase in ["unable to perform", "incomplete examination", "obstruction"]):
-                physical_exam_highlight = "\n\n⚠️ CRITICAL: Physical exam shows anatomical obstruction clues"
+        case_context = json.dumps(exam_info, indent=2) if isinstance(exam_info, dict) else str(exam_info)
     except Exception:
-        pass
-
-    # Extract patient history context if available (for amenorrhea cases)
-    history_context = ""
-    try:
-        if hasattr(scenario, "patient_information"):
-            patient_info = scenario.patient_information()
-            if isinstance(patient_info, dict):
-                # Look for amenorrhea-related context
-                history_text = str(patient_info).lower()
-                if "amenorrhea" in history_text or "menstrual" in history_text:
-                    history_context = "\n\nClinical context: Primary amenorrhea case"
-    except Exception:
-        pass
+        case_context = ""
 
     user_prompt = (
         f"Doctor proposed diagnosis: {raw_dx}\n\n"
         f"{options_txt}\n\n"
-        f"{history_context}"
-        f"Case evidence (tests/exam):\n{case_context}\n"
-        f"{physical_exam_highlight}\n\n"
-        f"Task: Normalize the diagnosis to the most specific, accurate label based on the evidence above. "
-        f"Pay special attention to physical exam findings that distinguish between similar anatomical conditions."
+        f"Case context (for spelling/terminology only):\n{case_context[:2000]}\n\n"
+        f"Task: Output ONLY a rephrase for standard spelling/terminology. Do NOT substitute a different diagnosis."
     )
     out = query_model(normalizer_llm, user_prompt, DX_NORMALIZER_SYSTEM, clip_prompt=True).strip()
     if out.lower().startswith("final_dx:"):
         normalized = out.split(":", 1)[1].strip()
-        
-        # CONSERVATIVE CHECK: If original diagnosis is already specific and reasonable, be cautious about changing it
         raw_lower = raw_dx.lower().strip('.,;:!?')
         normalized_lower = normalized.lower().strip('.,;:!?')
-        
-        # Helper function to check if diagnosis is specific (not too generic)
-        def is_specific_diagnosis(dx):
-            generic_terms = ["infection", "disease", "syndrome", "disorder", "injury", "mass", "lesion", 
-                           "pneumonia", "diarrhea", "anemia", "hyponatremia", "fever"]
-            dx_lower = dx.lower()
-            # If it's just a generic term without modifiers, it's too generic
-            if any(dx_lower == term or dx_lower.startswith(term + " ") for term in generic_terms):
-                return False
-            # If it has specific modifiers or is a named condition, it's specific
-            return len(dx.split()) > 1 or any(char.isupper() for char in dx if char.isalpha())
-        
-        # CONSERVATIVE RULE: If original is already specific and normalized is very different, keep original
-        if is_specific_diagnosis(raw_dx) and raw_lower != normalized_lower:
-            # Check if normalized is semantically very different (more than 50% word difference)
-            raw_words = set(raw_lower.split())
-            norm_words = set(normalized_lower.split())
-            if raw_words and norm_words:
-                overlap = len(raw_words & norm_words)
-                total_unique = len(raw_words | norm_words)
-                similarity = overlap / total_unique if total_unique > 0 else 0
-                # If similarity is very low (<0.3), the normalizer might be making a wrong correction
-                if similarity < 0.3:
-                    # Only override if we have strong evidence-based rules
-                    pass  # Continue to evidence-based rules
-                elif similarity > 0.7:
-                    # If they're very similar, prefer the original (it's probably fine)
-                    return raw_dx
-        
-        # Enhanced post-processing: correct common misdiagnoses based on evidence
-        exam_info_dict = exam_info if isinstance(exam_info, dict) else {}
-        exam_str = json.dumps(exam_info_dict).lower() if isinstance(exam_info, dict) else str(exam_info).lower()
-        
-        # Get test results
-        test_results_str = ""
-        try:
-            if hasattr(scenario, "scenario_dict") and isinstance(scenario.scenario_dict, dict):
-                test_results = scenario.scenario_dict.get("OSCE_Examination", {}).get("Test_Results", {})
-                test_results_str = json.dumps(test_results).lower()
-        except:
-            pass
-        
-        all_evidence = exam_str + " " + test_results_str
-        
-        # Rule 1: Amenorrhea with anatomical obstruction - distinguish hymen vs septum
-        if any(term in raw_lower or term in normalized_lower for term in ["imperforate hymen", "hymen", "vaginal obstruction"]):
-            if "Pelvic_Examination" in exam_info_dict:
-                pelvic_exam = str(exam_info_dict["Pelvic_Examination"]).lower()
-                if "unable to perform" in pelvic_exam and "complete examination" in pelvic_exam:
-                    if "external genitalia" in pelvic_exam and ("unremarkable" in pelvic_exam or "normal" in pelvic_exam):
-                        if "septum" not in normalized_lower and "septum" not in raw_lower:
-                            return "Vaginal septum"
-                    elif "bulging" in pelvic_exam or "visible" in pelvic_exam:
-                        if "hymen" not in normalized_lower:
-                            return "Imperforate hymen"
-        
-        # Rule 2: Bullous pemphigoid vs contact dermatitis
-        if any(term in raw_lower or term in normalized_lower for term in ["contact dermatitis", "allergic contact"]):
-            if ("tense" in all_evidence and "bullae" in all_evidence) or \
-               ("immunofluorescence" in all_evidence and ("igg" in all_evidence or "c3" in all_evidence)):
-                if "pemphigoid" not in normalized_lower:
-                    return "Bullous pemphigoid"
-        
-        # Rule 3: Neuroleptic Malignant Syndrome vs Serotonin Syndrome
-        if any(term in raw_lower or term in normalized_lower for term in ["serotonin syndrome", "serotonin"]):
-            if (("rigidity" in all_evidence and "muscle" in all_evidence) or \
-                ("creatine kinase" in all_evidence or "ck" in all_evidence or ("elevated" in all_evidence and "ck" in all_evidence))):
-                try:
-                    patient_info = scenario.patient_information()
-                    if isinstance(patient_info, dict):
-                        history_str = json.dumps(patient_info).lower()
-                        if "neuroleptic" in history_str or "antipsychotic" in history_str:
-                            if "neuroleptic" not in normalized_lower and "malignant" not in normalized_lower:
-                                return "Neuroleptic Malignant Syndrome"
-                except:
-                    pass
-        
-        # Rule 4: Rectal bleeding - Hemorrhoids vs Rectal cancer vs Rectal prolapse
-        if any(term in raw_lower or term in normalized_lower for term in ["rectal cancer", "rectal prolapse", "rectal mass"]):
-            if "Rectovaginal_Examination" in exam_info_dict or "rectovaginal" in all_evidence:
-                rect_exam = str(exam_info_dict.get("Rectovaginal_Examination", "")).lower()
-                if "prolapsed mass" in rect_exam and "easily pushed back" in rect_exam:
-                    if "hemorrhoids" not in normalized_lower and "hemorrhoid" not in raw_lower:
-                        return "Hemorrhoids"
-                elif "fixed" in rect_exam and "not movable" in rect_exam:
-                    if "cancer" not in normalized_lower:
-                        return "Rectal cancer"
-        
-        # Rule 5: Seizure types - Complex partial vs Psychogenic non-epileptic
-        if any(term in raw_lower or term in normalized_lower for term in ["psychogenic", "non-epileptic", "pnes"]):
-            if "electroencephalogram" in all_evidence or "eeg" in all_evidence:
-                if "spikes" in all_evidence or "sharp waves" in all_evidence or "temporal" in all_evidence:
-                    if "complex partial" not in normalized_lower and "partial seizure" not in normalized_lower:
-                        return "Complex partial seizure"
-        
-        # Rule 6: Diarrhea after antibiotics - C. difficile vs generic antibiotic-associated
-        if any(term in raw_lower or term in normalized_lower for term in ["antibiotic-associated", "antibiotic associated", "antibiotic diarrhea"]):
-            if "clostridium" in all_evidence or "c. difficile" in all_evidence or "c difficile" in all_evidence or "toxin" in all_evidence:
-                if "difficile" not in normalized_lower:
-                    return "C. difficile colitis"
-        
-        # Rule 7: Cholangitis types - Primary sclerosing vs Primary biliary
-        if "primary biliary cholangitis" in normalized_lower or "primary biliary" in raw_lower:
-            if "ulcerative colitis" in all_evidence or "ibd" in all_evidence or "inflammatory bowel" in all_evidence:
-                if "sclerosing" not in normalized_lower:
-                    return "Primary sclerosing cholangitis"
-            elif "antimitochondrial" in all_evidence or "ama" in all_evidence:
-                    # Keep primary biliary if AMA positive
-                    pass
-        
-        # Rule 8: Shoulder conditions - Adhesive capsulitis vs Rotator cuff vs Impingement
-        if any(term in raw_lower or term in normalized_lower for term in ["rotator cuff", "shoulder impingement", "impingement syndrome"]):
-            if "Shoulder_Examination" in exam_info_dict:
-                shoulder_exam = str(exam_info_dict["Shoulder_Examination"]).lower()
-                # Adhesive capsulitis: global restriction, especially external rotation
-                if "external rotation" in shoulder_exam and ("45" in shoulder_exam or "limited" in shoulder_exam):
-                    if "radiograph" in all_evidence or "x-ray" in all_evidence:
-                        if "normal" in all_evidence and "adhesive" not in normalized_lower and "capsulitis" not in normalized_lower:
-                            return "Adhesive capsulitis"
-        
-        # Rule 9: Obstructive lung disease - Asthma vs COPD
-        if "copd" in normalized_lower or ("chronic obstructive" in normalized_lower and "pulmonary" in normalized_lower):
-            if "spirometry" in all_evidence:
-                if "reversible" in all_evidence or "bronchodilator" in all_evidence:
-                    if "asthma" not in normalized_lower:
-                        return "Asthma"
-            # Also check for episodic pattern (asthma) vs progressive (COPD)
+        # Conservative: reject substitution (different condition). Keep only rephrases.
+        raw_words = set(raw_lower.split())
+        norm_words = set(normalized_lower.split())
+        if raw_words and norm_words:
+            overlap = len(raw_words & norm_words)
+            total_unique = len(raw_words | norm_words)
+            similarity = overlap / total_unique if total_unique > 0 else 0
+            if similarity < 0.4:
+                return raw_dx  # Normalizer tried to substitute; keep original
+        # NEJM: if answer choices exist, prefer verbatim match from list
+        if options_txt and dataset in ["NEJM", "NEJM_Ext"]:
             try:
-                patient_info = scenario.patient_information()
-                if isinstance(patient_info, dict):
-                    history_str = json.dumps(patient_info).lower()
-                    if "episodic" in history_str or "worse at night" in history_str or "triggered by" in history_str:
-                        if "asthma" not in normalized_lower:
-                            return "Asthma"
-            except:
+                opts = [a["text"] for a in scenario.scenario_dict.get("answers", []) if isinstance(a, dict) and "text" in a]
+                for o in opts:
+                    if o.strip().lower() == normalized_lower or o.strip().lower() == raw_lower:
+                        return o.strip()
+                if raw_dx.strip() in opts:
+                    return raw_dx.strip()
+            except Exception:
                 pass
-        
-        # Rule 10: Bone tumors - Osteoclastoma vs Aneurysmal bone cyst
-        if "aneurysmal bone cyst" in normalized_lower or "bone cyst" in normalized_lower:
-            if "soap bubble" in all_evidence or "lytic lesion" in all_evidence:
-                if "osteoclastoma" not in normalized_lower and "giant cell" not in normalized_lower:
-                    return "Osteoclastoma"
-        
-        # Rule 11: Eczematous conditions - Eczematous dermatitis vs Atopic dermatitis
-        if "atopic dermatitis" in normalized_lower or "atopic" in raw_lower:
-            if "eczematous" in all_evidence and "atopy" not in all_evidence and "atopic" not in all_evidence:
-                if "eczematous dermatitis" not in normalized_lower:
-                    return "Eczematous dermatitis"
-        
-        # Rule 12: Gonococcal infection - Disseminated vs localized
-        if "gonococcal arthritis" in normalized_lower or "gonococcal" in raw_lower:
-            if "disseminated" in all_evidence or ("skin" in all_evidence and "joint" in all_evidence):
-                if "disseminated" not in normalized_lower:
-                    return "Disseminated Gonococcal Infection"
-        
-        # Rule 13: Prevent over-specificity - if original is correct, don't add unnecessary location
-        # Check if normalized just adds location to an already correct diagnosis
-        if raw_lower in normalized_lower or normalized_lower in raw_lower:
-            # If they're very similar, prefer the simpler one (original)
-            if len(raw_dx.split()) < len(normalized.split()):
-                # Only keep normalized if it adds critical specificity
-                if not any(keyword in normalized_lower for keyword in ["disseminated", "neonatal", "acute", "chronic"]):
-                    return raw_dx
-        
-        # Rule 14: Respiratory Distress Syndrome - don't add "Neonatal" if not specified
-        if "neonatal respiratory distress syndrome" in normalized_lower:
-            if "neonatal" not in all_evidence and "newborn" not in all_evidence and "premature" not in all_evidence:
-                if "respiratory distress syndrome" in raw_lower:
-                    return "Respiratory Distress Syndrome"
-        
-        # Rule 15: Osteoarthritis - don't add location if original is correct
-        if "osteoarthritis" in raw_lower and "osteoarthritis" in normalized_lower:
-            if "hip and knee" in normalized_lower or "of the" in normalized_lower:
-                # Check if location was actually specified in evidence
-                if "hip" not in all_evidence and "knee" not in all_evidence:
-                    return "Osteoarthritis"
-        
-        # Rule 16: Insect bites - Bed bug vs generic
-        if "insect bite" in normalized_lower or "insect bite" in raw_lower:
-            if "bed bug" in all_evidence or "linear" in all_evidence and "papules" in all_evidence:
-                if "bed bug" not in normalized_lower:
-                    return "Bed bug bite"
-        
         return normalized
     return raw_dx
 
 # -----------------
 # Main run function
 # -----------------
-def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor_llm, patient_llm, measurement_llm, moderator_llm, num_scenarios, dataset, img_request, total_inferences, anthropic_api_key=None, evidence_lock=False, guideline_snippets_path="data/guideline_snippets.csv", use_intake_assistant=False, intake_llm="gpt4", intake_turns=6, question_controller_llm=None, scenario_ids=None):
+def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor_llm, patient_llm, measurement_llm, moderator_llm, num_scenarios, dataset, img_request, total_inferences, anthropic_api_key=None, evidence_lock=False, guideline_snippets_path="data/guideline_snippets.csv", use_intake_assistant=False, intake_llm="gpt4", intake_turns=6, question_controller_llm=None, scenario_ids=None, use_reasoning_helpers=True):
     # Use provided API key, or fall back to environment variable
     if not api_key or api_key == "":
         api_key = os.environ.get("OPENAI_API_KEY", "")
@@ -1644,8 +1519,14 @@ def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor
 
         doctor_dialogue = ""
         attempted_commit = False  # track if we've seen one commit attempt
+        reasoning_check_done = False  # track if we've run Reasoning Critic + Evidence Checker for this scenario
+        devil_advocate_done = False  # track if we've run Devil's Advocate for this scenario
+        consecutive_low_quality = 0  # question quality scorer: consecutive low scores
+        # Allow 2 extra iterations for reasoning + devil's advocate feedback when helpers are on
+        max_iters = total_inferences + (2 if use_reasoning_helpers else 0)
 
-        for _inf_id in range(total_inferences):
+        for _inf_id in range(max_iters):
+            is_feedback_turn = use_reasoning_helpers and _inf_id >= total_inferences
             # NEJM image policy
             if dataset == "NEJM":
                 if img_request:
@@ -1655,17 +1536,23 @@ def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor
             else:
                 imgs = False
 
-            # Final turn hint
-            if _inf_id == total_inferences - 1:
+            # Final turn hint (last normal turn or last iteration overall)
+            if _inf_id == total_inferences - 1 and not is_feedback_turn:
                 pi_dialogue += "\n\n⚠️ CRITICAL: This is your FINAL turn. You MUST output 'DIAGNOSIS READY: [diagnosis]' now. Do not ask another question - provide your diagnosis immediately.\n"
+            elif _inf_id == max_iters - 1 and is_feedback_turn:
+                pi_dialogue += "\n\n⚠️ This is your last chance. Output 'DIAGNOSIS READY: [diagnosis]' now.\n"
 
-            # Question Controller: propose high-yield question (prevent transcript pollution)
-            doctor_input = pi_dialogue  # Start with clean patient message
-            if inf_type != "human_doctor":
-                # Heuristic: always call in early turns (first 5), OR call if not after test request AND not last turn
+            # Question Controller: propose high-yield question (skip on feedback turns)
+            doctor_input = pi_dialogue
+            if inf_type != "human_doctor" and not is_feedback_turn:
+                is_feedback_content = pi_dialogue.strip().startswith("REASONING CHECK:") or pi_dialogue.strip().startswith("DEVIL'S ADVOCATE:")
+                # Heuristic: skip controller when content is moderator feedback; else call in early turns or when not after test request
                 should_call_controller = (
-                    (_inf_id < 5) or 
-                    (("REQUEST TEST" not in doctor_dialogue) and (_inf_id < total_inferences - 1))
+                    not is_feedback_content
+                    and (
+                        (_inf_id < 5) or
+                        (("REQUEST TEST" not in doctor_dialogue) and (_inf_id < total_inferences - 1))
+                    )
                 )
                 if should_call_controller:
                     transcript_text = (doctor_agent.agent_hist + f"\nPatient latest: {pi_dialogue}\n").strip()
@@ -1684,18 +1571,36 @@ def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor
                         remaining=remaining,
                         exam_info=exam_info
                     )
+                    # Optional: test-ordering suggestion when we have a differential
+                    working_ddx_strings = _get_working_ddx_strings(doctor_agent.evidence_ledger)
+                    extra_guidance = ""
+                    if len(working_ddx_strings) >= 2:
+                        try:
+                            exam_raw = scenario.exam_information()
+                            exam_and_tests_text = json.dumps(exam_raw, indent=2) if isinstance(exam_raw, dict) else str(exam_raw)
+                        except Exception:
+                            exam_and_tests_text = ""
+                        suggested_test = propose_test_for_ddx(
+                            controller_llm_to_use, transcript_text, working_ddx_strings, exam_and_tests_text
+                        )
+                        if suggested_test:
+                            extra_guidance = f"\nConsider requesting or asking: {suggested_test}"
+                    if consecutive_low_quality >= 2:
+                        extra_guidance += "\n\nConsider asking a more discriminative question (one that rules in/out specific diagnoses)."
                     # Create doctor_input with guidance (DO NOT modify pi_dialogue)
                     doctor_input = (
                         f"{pi_dialogue}\n\n"
                         f"MODERATOR GUIDANCE: Ask this next question verbatim unless impossible:\n"
-                        f"\"{next_q}\""
+                        f"\"{next_q}\"{extra_guidance}"
                     )
 
             # Doctor turn
             if inf_type == "human_doctor":
                 doctor_dialogue = input("\nQuestion for patient: ")
             else:
-                doctor_dialogue = doctor_agent.inference_doctor(doctor_input, image_requested=imgs)
+                doctor_dialogue = doctor_agent.inference_doctor(
+                    doctor_input, image_requested=imgs, allow_extra_feedback_turn=is_feedback_turn
+                )
 
             print("Doctor [{}%]:".format(int(((_inf_id+1)/total_inferences)*100)), doctor_dialogue)
 
@@ -1736,6 +1641,67 @@ def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor
                         attempted_commit = True
                         continue  # give the doctor another chance within the same scene
 
+                # Differential-first: proposed diagnosis must be in working_ddx (unless ddx empty)
+                dx_match = re.search(r"DIAGNOSIS READY:\s*(.*)", doctor_dialogue)
+                proposed_dx_raw = dx_match.group(1).strip() if dx_match else ""
+                proposed_dx = re.sub(r"\s*\[?\s*CONFIDENCE:\s*(?:high|medium|low)\s*\]?\s*$", "", proposed_dx_raw, flags=re.I).strip()
+                working_ddx_strings = _get_working_ddx_strings(doctor_agent.evidence_ledger)
+                if not _dx_in_working_ddx(proposed_dx, working_ddx_strings) and working_ddx_strings and _inf_id < max_iters - 1:
+                    ddx_list_str = "; ".join(working_ddx_strings[:5])
+                    pi_dialogue = (
+                        f"MODERATOR: Your DIAGNOSIS READY must be one of your working_ddx. You listed: {ddx_list_str}. "
+                        f"You proposed '{proposed_dx}'. Please output DIAGNOSIS READY: <one of the above> or ask one more question / request a test."
+                    )
+                    print("MODERATOR: Differential-first reject (diagnosis not in working_ddx)", flush=True)
+                    continue
+
+                # First DIAGNOSIS READY + reasoning helpers: run critic + evidence checker, give doctor one more turn (or use extra feedback iteration).
+                if use_reasoning_helpers and not reasoning_check_done and ( _inf_id < total_inferences - 1 or is_feedback_turn ):
+                    transcript = (doctor_agent.agent_hist + "\nDoctor (latest): " + doctor_dialogue).strip()
+                    try:
+                        exam_raw = scenario.exam_information()
+                        exam_and_tests_text = json.dumps(exam_raw, indent=2) if isinstance(exam_raw, dict) else str(exam_raw)
+                    except Exception:
+                        exam_and_tests_text = ""
+                    critic_out = run_reasoning_critic(doctor_llm, transcript, proposed_dx)
+                    time.sleep(2.0)
+                    evidence_out = run_evidence_checker(doctor_llm, transcript, exam_and_tests_text, proposed_dx)
+                    reasoning_check_done = True
+                    pi_dialogue = (
+                        f"REASONING CHECK: {critic_out}\n\n"
+                        f"EVIDENCE CHECK: {evidence_out}\n\n"
+                        "If you still stand by your diagnosis, output DIAGNOSIS READY: [your diagnosis]. "
+                        "If you want to ask one more question or request a test, do that instead."
+                    )
+                    continue
+
+                # Second DIAGNOSIS READY + devil's advocate: one more adversarial round
+                if use_reasoning_helpers and reasoning_check_done and not devil_advocate_done and ( _inf_id < total_inferences - 1 or is_feedback_turn ):
+                    transcript = (doctor_agent.agent_hist + "\nDoctor (latest): " + doctor_dialogue).strip()
+                    devil_out = run_devils_advocate(doctor_llm, transcript, proposed_dx)
+                    time.sleep(2.0)
+                    devil_advocate_done = True
+                    pi_dialogue = (
+                        f"DEVIL'S ADVOCATE: {devil_out}\n\n"
+                        "If you still stand by your diagnosis, output DIAGNOSIS READY: [your diagnosis]. "
+                        "Otherwise ask one more question or request a test."
+                    )
+                    continue
+
+                # Uncertainty-gated: if confidence is low, trigger one more round (devil's advocate) if we have turns
+                confidence_low = bool(re.search(r"CONFIDENCE:\s*(?:low|uncertain)", proposed_dx_raw, re.I))
+                if confidence_low and _inf_id < max_iters - 1 and not devil_advocate_done:
+                    transcript = (doctor_agent.agent_hist + "\nDoctor (latest): " + doctor_dialogue).strip()
+                    devil_out = run_devils_advocate(doctor_llm, transcript, proposed_dx)
+                    time.sleep(2.0)
+                    devil_advocate_done = True
+                    pi_dialogue = (
+                        f"DEVIL'S ADVOCATE (low confidence round): {devil_out}\n\n"
+                        "Reconsider and then output DIAGNOSIS READY: [your diagnosis] or ask one more question."
+                    )
+                    continue
+
+                # Grade and break
                 # DX Normalizer: standardize diagnosis label before comparison
                 # Extract original diagnosis for logging
                 original_match = re.search(r"DIAGNOSIS READY:\s*(.*)", doctor_dialogue)
@@ -1769,15 +1735,26 @@ def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor
                       int((total_correct/total_presents)*100))
                 break
 
-            # Measurement agent
-            if "REQUEST TEST" in doctor_dialogue:
+            # Question quality scorer: after a doctor question (not on feedback-only iterations)
+            if not is_feedback_turn and inf_type != "human_doctor" and "DIAGNOSIS READY" not in doctor_dialogue and "REQUEST TEST" not in doctor_dialogue:
+                is_feedback = pi_dialogue.strip().startswith("REASONING CHECK:") or pi_dialogue.strip().startswith("DEVIL'S ADVOCATE:")
+                if not is_feedback:
+                    transcript_for_q = (doctor_agent.agent_hist + "\nDoctor (latest): " + doctor_dialogue).strip()
+                    q_score = run_question_quality_scorer(doctor_llm, transcript_for_q, doctor_dialogue[:500])
+                    if q_score <= 2:
+                        consecutive_low_quality += 1
+                    else:
+                        consecutive_low_quality = 0
+
+            # Measurement agent and patient reply only on normal turns (not feedback-only)
+            if not is_feedback_turn and "REQUEST TEST" in doctor_dialogue:
                 pi_dialogue = meas_agent.inference_measurement(doctor_dialogue)
                 print("Measurement [{}%]:".format(int(((_inf_id+1)/total_inferences)*100)), pi_dialogue)
                 patient_agent.add_hist(pi_dialogue)
                 # Turn on the "result integration gate" right after MeasurementAgent returns a result
                 doctor_agent.must_integrate_result = True
                 doctor_agent.pending_result_text = pi_dialogue
-            else:
+            elif not is_feedback_turn:
                 # Patient reply
                 if inf_type == "human_patient":
                     pi_dialogue = input("\nResponse to doctor: ")
@@ -1786,8 +1763,8 @@ def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor
                 print("Patient [{}%]:".format(int(((_inf_id+1)/total_inferences)*100)), pi_dialogue)
                 meas_agent.add_hist(pi_dialogue)
 
-            # Prevent API timeouts
-            time.sleep(1.0)
+            # Throttle to avoid rate limits (TPM); also prevents API timeouts
+            time.sleep(3.0)
 
 
 # ----------------------------
@@ -1823,6 +1800,7 @@ if __name__ == "__main__":
     parser.add_argument('--intake_assistant_turns', type=int, default=6, help='Maximum number of intake assistant follow-up questions before summarizing.')
     parser.add_argument('--question_controller_llm', type=str, default=None, required=False, help='Backend LLM for the question controller (defaults to doctor_llm if not specified).')
     parser.add_argument('--scenario_ids', type=int, nargs='+', default=None, required=False, help='Specific scenario IDs to run (e.g., --scenario_ids 199 203). If not provided, runs sequentially from 0.')
+    parser.add_argument('--no_reasoning_helpers', action='store_true', help='Disable Reasoning Critic and Evidence Checker; first DIAGNOSIS READY is graded immediately.')
 
     args = parser.parse_args()
 
@@ -1848,5 +1826,6 @@ if __name__ == "__main__":
         intake_llm=args.intake_assistant_llm,
         intake_turns=args.intake_assistant_turns,
         question_controller_llm=args.question_controller_llm,
-        scenario_ids=args.scenario_ids
+        scenario_ids=args.scenario_ids,
+        use_reasoning_helpers=not args.no_reasoning_helpers
     )
